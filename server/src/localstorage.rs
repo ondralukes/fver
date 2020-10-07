@@ -1,10 +1,12 @@
-use crate::error::Error;
-use crate::error::Error::{HashCollision, IllegalState};
-use hex::encode;
-use openssl::sha::sha256;
 use std::fs::{create_dir_all, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+use hex::encode;
+use openssl::sha::sha256;
+
+use crate::error::Error;
+use crate::error::Error::{CorruptedStorage, HashCollision};
 
 pub struct LocalStorage {
     root: PathBuf,
@@ -18,8 +20,8 @@ impl LocalStorage {
         Ok(Self { root })
     }
 
-    pub fn set_key(&self, key: &[u8], username: &str) -> Result<(), Error> {
-        let hash = sha256(username.as_bytes());
+    pub fn set_key(&self, key: &[u8], username: &[u8]) -> Result<(), Error> {
+        let hash = sha256(username);
         let filename = encode(hash);
         let p = self.root.join("keys").join(filename);
         if p.exists() {
@@ -28,16 +30,11 @@ impl LocalStorage {
         let mut file = File::create(p)?;
         file.write_all(&(key.len() as u32).to_le_bytes())?;
         file.write_all(key)?;
-        file.write_all(username.as_bytes())?;
+        file.write_all(username)?;
         Ok(())
     }
 
-    pub fn get_key_by_username(&self, username: &str) -> Result<Option<(String, Vec<u8>)>, Error> {
-        let hash = sha256(username.as_bytes());
-        self.get_key(hash)
-    }
-
-    pub fn get_key(&self, user_hash: [u8; 32]) -> Result<Option<(String, Vec<u8>)>, Error> {
+    pub fn get_key(&self, user_hash: [u8; 32]) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error> {
         let filename = encode(user_hash);
         let p = self.root.join("keys").join(filename);
         if !p.exists() {
@@ -49,13 +46,13 @@ impl LocalStorage {
         file.read_exact(&mut key_len_bytes)?;
         let key_len = u32::from_le_bytes(key_len_bytes);
         if key_len > 4096 {
-            return Err(IllegalState);
+            return Err(CorruptedStorage);
         }
         key.resize(key_len as usize, 0);
         file.read_exact(&mut key)?;
         let mut name = Vec::new();
         file.read_to_end(&mut name)?;
-        Ok(Some((String::from_utf8(name)?, key)))
+        Ok(Some((name, key)))
     }
 
     pub fn set_file(

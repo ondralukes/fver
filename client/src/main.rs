@@ -1,13 +1,6 @@
-mod error;
-mod localstorage;
-
-extern crate dirs;
-extern crate hex;
-extern crate openssl;
-
 use crate::error::Error;
 use crate::error::Error::NoDataDirectory;
-use crate::localstorage::LocalStorage;
+use crate::remotestorage::RemoteStorage;
 use dirs::data_dir;
 use hex::encode;
 use openssl::ec::{EcGroup, EcKey};
@@ -16,6 +9,7 @@ use openssl::nid::Nid;
 use openssl::pkey::{PKey, Private};
 use openssl::sha::sha256;
 use openssl::sign::{Signer, Verifier};
+use std::borrow::Borrow;
 use std::convert::TryInto;
 use std::env::args;
 use std::fs::{create_dir_all, File};
@@ -24,6 +18,9 @@ use std::io::{stdin, stdout, BufRead, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::exit;
 
+mod error;
+mod remotestorage;
+
 struct Session {
     key: PKey<Private>,
     username: String,
@@ -31,6 +28,7 @@ struct Session {
 
 impl Session {
     fn login() -> Result<Self, Error> {
+        let mut storage = RemoteStorage::new("localhost:37687")?;
         let mut config_path = data_dir().ok_or(NoDataDirectory)?;
         config_path.push("fver");
         let key;
@@ -45,12 +43,22 @@ impl Session {
             username_file.read_to_end(&mut username_vec)?;
             username = String::from_utf8(username_vec)?;
         } else {
-            print!("Enter new username: ");
-            stdout().flush()?;
-            let mut input = String::new();
-            stdin().lock().read_line(&mut input)?;
-            input.retain(|c| c != '\n' && c != '\r');
-            username = input;
+            loop {
+                print!("Enter new username: ");
+                stdout().flush()?;
+                let mut input = String::new();
+                stdin().lock().read_line(&mut input)?;
+                input.retain(|c| c != '\n' && c != '\r');
+                match storage.get_key_by_username(&input)? {
+                    None => {
+                        username = input;
+                        break;
+                    }
+                    Some(_) => {
+                        println!("Username already registered.");
+                    }
+                }
+            }
             key = PKey::from_ec_key(EcKey::generate(
                 EcGroup::from_curve_name(Nid::SECP384R1)?.as_ref(),
             )?)?;
@@ -62,18 +70,21 @@ impl Session {
             let mut username_file = File::create(config_path.join("username"))?;
             username_file.write_all(username.as_bytes())?;
         }
-        let storage = LocalStorage::new("lks")?;
         match storage.get_key_by_username(&username)? {
             None => {
                 println!("Key not registered. Registering.");
                 storage.set_key(&key.public_key_to_der()?, &username)?;
             }
-            _ => {}
+            Some((_, remote_key)) => {
+                if remote_key != key.public_key_to_der()? {
+                    eprintln!("Username already registered with different key.");
+                    exit(1);
+                }
+            }
         }
         println!("Logged in as {}", username);
         Ok(Self { key, username })
     }
-
     fn sign<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
         let mut file = File::open(path)?;
         let mut hasher = Hasher::new(MessageDigest::sha256())?;
@@ -81,8 +92,7 @@ impl Session {
         hash_and_sign(&mut file, &mut hasher, &mut signer)?;
         let hash = hasher.finish()?;
         let signature = signer.sign_to_vec()?;
-        println!("{}", encode(&hash));
-        LocalStorage::new("lks").unwrap().set_file(
+        RemoteStorage::new("localhost:37687").unwrap().set_file(
             hash.as_ref().try_into().unwrap(),
             self.username_hash()?,
             &signature,
@@ -96,7 +106,7 @@ impl Session {
         io::copy(&mut file, &mut hasher)?;
         let hash = hasher.finish()?;
         println!("{}", encode(&hash));
-        let storage = LocalStorage::new("lks")?;
+        let mut storage = RemoteStorage::new("localhost:37687")?;
         let file_sig = storage.get_file(hash.as_ref().try_into().unwrap())?;
         match file_sig {
             None => {
@@ -104,7 +114,7 @@ impl Session {
                 exit(1);
             }
             Some((user_hash, signature)) => {
-                let user = storage.get_key(user_hash)?;
+                let user = storage.get_key(user_hash.try_into().unwrap())?;
                 match user {
                     None => {
                         println!("Key not found.");
@@ -175,7 +185,7 @@ fn main() {
         }
         "key" => {
             let username = args.next().unwrap();
-            let key = LocalStorage::new("lks")
+            let key = RemoteStorage::new("localhost:37687")
                 .unwrap()
                 .get_key_by_username(&username)
                 .unwrap();
