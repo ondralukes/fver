@@ -12,7 +12,6 @@ pub enum Error {
     IOError(io::Error),
     HashCollision,
     CorruptedStorage,
-    UnknownCommand,
     CorruptedMessage,
 }
 

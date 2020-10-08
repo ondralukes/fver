@@ -1,14 +1,14 @@
 use crate::error::Error::{CorruptedMessage, EncodingError, IOError, NetworkError, OpenSSLError};
-use openssl::error::ErrorStack;
 use simpletcp;
 use simpletcp::simpletcp::MessageError;
+use std::array::TryFromSliceError;
 use std::fmt::{Debug, Formatter};
 use std::string::FromUtf8Error;
 use std::{fmt, io};
 
 pub enum Error {
     NetworkError(simpletcp::simpletcp::Error),
-    CorruptedMessage(MessageError),
+    CorruptedMessage,
     OpenSSLError(openssl::error::ErrorStack),
     IOError(io::Error),
     EncodingError(FromUtf8Error),
@@ -23,8 +23,14 @@ impl From<simpletcp::simpletcp::Error> for Error {
 }
 
 impl From<MessageError> for Error {
-    fn from(e: MessageError) -> Self {
-        CorruptedMessage(e)
+    fn from(_: MessageError) -> Self {
+        CorruptedMessage
+    }
+}
+
+impl From<TryFromSliceError> for Error {
+    fn from(_: TryFromSliceError) -> Self {
+        CorruptedMessage
     }
 }
 
@@ -50,7 +56,7 @@ impl Debug for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             NetworkError(e) => f.write_fmt(format_args!("NetworkError: {:?}", e)),
-            CorruptedMessage(e) => f.write_fmt(format_args!("CorruptedMessage: {:?}", e)),
+            CorruptedMessage => f.write_str("CorruptedMessage"),
             OpenSSLError(e) => f.write_fmt(format_args!("OpenSSLError: {:?}", e)),
             IOError(e) => f.write_fmt(format_args!("IOError: {:?}", e)),
             EncodingError(e) => f.write_fmt(format_args!("EncodingError: {:?}", e)),

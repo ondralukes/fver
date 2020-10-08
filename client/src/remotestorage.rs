@@ -3,6 +3,9 @@ use crate::error::Error::ServerError;
 use hex::encode;
 use openssl::sha::sha256;
 use simpletcp::simpletcp::{Message, TcpStream};
+use std::convert::TryInto;
+use std::io;
+use std::io::{stdout, Write};
 use std::net::ToSocketAddrs;
 
 pub struct RemoteStorage {
@@ -77,7 +80,6 @@ impl RemoteStorage {
             encode(&signature[..8])
         );
         let mut m = Message::new();
-        m.write_u8(3);
         m.write_buffer(&hash);
         m.write_buffer(&user_hash);
         m.write_buffer(signature);
@@ -91,12 +93,17 @@ impl RemoteStorage {
         Ok(())
     }
 
-    pub fn get_file(&mut self, hash: [u8; 32]) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error> {
+    pub fn get_file(&mut self, hash: [u8; 32]) -> Result<Option<SignedFile>, Error> {
         print!("[Remote] get_file h={}: ", encode(&hash[..8]));
         let mut m = Message::new();
         m.write_u8(2);
         m.write_buffer(&hash);
         self.conn.write_blocking(&m)?;
+        self.receive_file()
+    }
+
+    fn receive_file(&mut self) -> Result<Option<SignedFile>, Error> {
+        print!("recv_file: ");
         let mut resp = self.conn.read_blocking()?;
         return match resp.read_i8()? {
             0 => {
@@ -104,19 +111,54 @@ impl RemoteStorage {
                 Ok(None)
             }
             1 => {
-                let user_hash = resp.read_buffer()?.to_vec();
+                let hash: [u8; 32] = resp.read_buffer()?.to_vec()[..32].try_into()?;
+                let user_hash: [u8; 32] = resp.read_buffer()?.to_vec()[..32].try_into()?;
+                let prev_hash: [u8; 32] = resp.read_buffer()?.to_vec()[..32].try_into()?;
                 let signature = resp.read_buffer()?.to_vec();
                 println!(
-                    "u={} sig={}",
+                    "hash={} u={} prev_hash = {} sig={}",
+                    encode(&hash[..8]),
                     encode(&user_hash[..8]),
+                    encode(&prev_hash[..8]),
                     encode(&signature[..8])
                 );
-                Ok(Some((user_hash, signature)))
+                Ok(Some(SignedFile {
+                    hash,
+                    user_hash,
+                    prev_hash,
+                    signature,
+                }))
             }
             _ => {
                 println!("Error");
                 Err(ServerError)
             }
         };
+    }
+
+    pub fn get_prev(&mut self) -> Result<Option<SignedFile>, Error> {
+        print!("[Remote] get_prev: ");
+        stdout().lock().flush().unwrap();
+        let mut m = Message::new();
+        m.write_u8(4);
+        self.conn.write_blocking(&m).unwrap();
+        self.receive_file()
+    }
+}
+
+pub struct SignedFile {
+    pub hash: [u8; 32],
+    pub user_hash: [u8; 32],
+    pub prev_hash: [u8; 32],
+    pub signature: Vec<u8>,
+}
+
+impl SignedFile {
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<(), io::Error> {
+        writer.write_all(&self.hash)?;
+        writer.write_all(&self.user_hash)?;
+        writer.write_all(&self.prev_hash)?;
+        writer.write_all(&self.signature)?;
+        Ok(())
     }
 }

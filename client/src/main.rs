@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::error::Error::NoDataDirectory;
-use crate::remotestorage::RemoteStorage;
+use crate::remotestorage::{RemoteStorage, SignedFile};
 use dirs::data_dir;
 use hex::encode;
 use openssl::ec::{EcGroup, EcKey};
@@ -9,7 +9,6 @@ use openssl::nid::Nid;
 use openssl::pkey::{PKey, Private};
 use openssl::sha::sha256;
 use openssl::sign::{Signer, Verifier};
-use std::borrow::Borrow;
 use std::convert::TryInto;
 use std::env::args;
 use std::fs::{create_dir_all, File};
@@ -90,9 +89,19 @@ impl Session {
         let mut hasher = Hasher::new(MessageDigest::sha256())?;
         let mut signer = Signer::new_without_digest(&self.key)?;
         hash_and_sign(&mut file, &mut hasher, &mut signer)?;
+
+        let mut storage = RemoteStorage::new("localhost:37687").unwrap();
+        let prev = storage.get_prev()?;
         let hash = hasher.finish()?;
+        match prev {
+            Some(prev) => {
+                prev.write_to(&mut signer)?;
+            }
+            _ => {}
+        }
+
         let signature = signer.sign_to_vec()?;
-        RemoteStorage::new("localhost:37687").unwrap().set_file(
+        storage.set_file(
             hash.as_ref().try_into().unwrap(),
             self.username_hash()?,
             &signature,
@@ -113,8 +122,8 @@ impl Session {
                 println!("No signature found.");
                 exit(1);
             }
-            Some((user_hash, signature)) => {
-                let user = storage.get_key(user_hash.try_into().unwrap())?;
+            Some(f) => {
+                let user = storage.get_key(f.user_hash.try_into().unwrap())?;
                 match user {
                     None => {
                         println!("Key not found.");
@@ -125,7 +134,13 @@ impl Session {
                         let mut verifier = Verifier::new_without_digest(key.as_ref())?;
                         file.seek(SeekFrom::Start(0))?;
                         io::copy(&mut file, &mut verifier)?;
-                        if verifier.verify(&signature)? {
+                        if f.prev_hash != [0; 32] {
+                            let prev = storage
+                                .get_file(f.prev_hash)?
+                                .expect("Failed to get prev file");
+                            prev.write_to(&mut verifier)?;
+                        }
+                        if verifier.verify(&f.signature)? {
                             println!("Signed by {}", username);
                         } else {
                             println!("INVALID signature");
@@ -177,7 +192,8 @@ fn main() {
         "sign" => {
             let file = args.next().unwrap();
             let session = Session::login().unwrap();
-            session.sign(file).unwrap();
+            let r = session.sign(file);
+            r.unwrap();
         }
         "verify" => {
             let file = args.next().unwrap();
@@ -197,6 +213,12 @@ fn main() {
                     println!("Key for {} : {}", username, encode(key));
                 }
             }
+        }
+        "enq" => {
+            RemoteStorage::new("localhost:37687")
+                .unwrap()
+                .get_prev()
+                .unwrap();
         }
         _ => {
             eprintln!("Unknown command!");

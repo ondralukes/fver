@@ -55,24 +55,21 @@ impl LocalStorage {
         Ok(Some((name, key)))
     }
 
-    pub fn set_file(
-        &self,
-        hash: [u8; 32],
-        user_hash: [u8; 32],
-        signature: &[u8],
-    ) -> Result<(), Error> {
-        let filename = encode(hash);
+    pub fn set_file(&self, f: SignedFile) -> Result<(), Error> {
+        let filename = encode(f.hash);
         let p = self.root.join("files").join(filename);
         if p.exists() {
             return Err(HashCollision);
         }
         let mut file = File::create(p)?;
-        file.write_all(&user_hash)?;
-        file.write_all(&signature)?;
+        file.write_all(&f.user_hash)?;
+        file.write_all(&f.prev_hash)?;
+        file.write_all(&f.signature)?;
+        self.set_prev(f.hash)?;
         Ok(())
     }
 
-    pub fn get_file(&self, hash: [u8; 32]) -> Result<Option<([u8; 32], Vec<u8>)>, Error> {
+    pub fn get_file(&self, hash: [u8; 32]) -> Result<Option<SignedFile>, Error> {
         let filename = encode(hash);
         let p = self.root.join("files").join(filename);
         if !p.exists() {
@@ -81,8 +78,45 @@ impl LocalStorage {
         let mut file = File::open(p)?;
         let mut user_hash = [0; 32];
         file.read_exact(&mut user_hash)?;
+        let mut prev_hash = [0; 32];
+        file.read_exact(&mut prev_hash)?;
         let mut signature = Vec::new();
         file.read_to_end(&mut signature)?;
-        Ok(Some((user_hash, signature)))
+        Ok(Some(SignedFile {
+            hash,
+            user_hash,
+            prev_hash,
+            signature,
+        }))
     }
+
+    pub fn set_prev(&self, hash: [u8; 32]) -> Result<(), Error> {
+        let p = self.root.join("prev_file");
+        let mut file = File::create(p)?;
+        file.write_all(&hash)?;
+        Ok(())
+    }
+
+    pub fn get_prev(&self) -> Result<Option<([u8; 32], SignedFile)>, Error> {
+        let p = self.root.join("prev_file");
+        if !p.exists() {
+            return Ok(None);
+        }
+        let mut file = File::open(p)?;
+        let mut r = [0; 32];
+        file.read_exact(&mut r)?;
+
+        let f = self.get_file(r)?;
+        return match f {
+            None => Ok(None),
+            Some(f) => Ok(Some((r, f))),
+        };
+    }
+}
+
+pub struct SignedFile {
+    pub hash: [u8; 32],
+    pub user_hash: [u8; 32],
+    pub prev_hash: [u8; 32],
+    pub signature: Vec<u8>,
 }
