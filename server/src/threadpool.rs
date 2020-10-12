@@ -2,17 +2,16 @@ use std::convert::TryInto;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread::{sleep, spawn};
+use std::thread::spawn;
 
 use simpletcp::simpletcp::{Message, TcpStream};
 use simpletcp::utils::{get_fd_array, poll_set_timeout, EV_POLLIN};
 
 use crate::error::Error;
-use crate::error::Error::{CorruptedMessage, CorruptedStorage};
-use crate::localstorage::{LocalStorage, SignedFile};
+use crate::error::Error::CorruptedStorage;
+use crate::localstorage::{LocalStorage, Signature, User};
 use crate::threadpool::ClientAction::{Disconnect, Enqueue, Respond};
 use crate::threadpool::ThreadMessage::Accept;
-use std::time::Duration;
 
 pub struct Server {
     threads: Vec<Thread>,
@@ -135,7 +134,12 @@ fn thread_loop(
                     Enqueue => {
                         let client = clients.remove(n as usize);
                         fds = get_fd_array(&clients);
-                        queue_tx.send(Accept(client));
+                        match queue_tx.send(Accept(client)) {
+                            Err(e) => {
+                                println!("Failed to send to queue thread: {}", e);
+                            }
+                            _ => {}
+                        }
                     }
                     Disconnect => {
                         clients.remove(n as usize);
@@ -150,14 +154,15 @@ fn thread_loop(
 
 fn process_message(mut m: Message, storage: &Mutex<LocalStorage>) -> ClientAction {
     return match c_try!(m.read_u8()) {
-        // set_key
+        // set_user
         0 => {
-            let storage = storage.lock().unwrap();
+            let mut storage = storage.lock().unwrap();
             let key = c_try!(m.read_buffer()).to_vec();
             let username = c_try!(m.read_buffer()).to_vec();
 
+            let u = User { username, key };
             let mut resp = Message::new();
-            match storage.set_key(&key, &username) {
+            match storage.set_user(u) {
                 Ok(_) => {
                     resp.write_i8(0);
                 }
@@ -168,62 +173,79 @@ fn process_message(mut m: Message, storage: &Mutex<LocalStorage>) -> ClientActio
             Respond(resp)
         }
 
-        // get_key
+        // get_user
         1 => {
-            let storage = storage.lock().unwrap();
-            let user_hash = c_try!(m.read_buffer());
+            let mut storage = storage.lock().unwrap();
+            let hash = c_try!(m.read_buffer()).to_vec();
+
             let mut resp = Message::new();
-            let r = storage.get_key(
-                user_hash
-                    .try_into()
-                    .or_else(|_| Err(CorruptedMessage))
-                    .unwrap(),
-            );
-            match r {
+            match storage.get_user(&hash) {
                 Ok(opt) => match opt {
                     None => {
                         resp.write_i8(0);
-                        Respond(resp)
                     }
-                    Some((username, key)) => {
+                    Some(u) => {
                         resp.write_i8(1);
-                        resp.write_buffer(&username);
-                        resp.write_buffer(&key);
-                        Respond(resp)
+                        resp.write_buffer(&u.username);
+                        resp.write_buffer(&u.key);
                     }
                 },
                 Err(_) => {
                     resp.write_i8(-1);
-                    Respond(resp)
                 }
             }
+            Respond(resp)
         }
 
-        //get_file
+        // get_obj
         2 => {
-            let hash = c_try!(m.read_buffer());
-            let storage = storage.lock().unwrap();
+            let mut storage = storage.lock().unwrap();
+            let hash = c_try!(m.read_buffer()).to_vec();
+
             let mut resp = Message::new();
-            return match storage.get_file(c_try!(hash.try_into())) {
-                Ok(opt) => match opt {
+            match storage.get_obj(&hash) {
+                Ok(obj) => match obj {
                     None => {
                         resp.write_i8(0);
-                        Respond(resp)
                     }
-                    Some(f) => {
+                    Some(obj) => {
                         resp.write_i8(1);
-                        resp.write_buffer(&f.hash);
-                        resp.write_buffer(&f.user_hash);
-                        resp.write_buffer(&f.prev_hash);
-                        resp.write_buffer(&f.signature);
-                        Respond(resp)
+                        for s in obj.sigs {
+                            resp.write_buffer(&s);
+                        }
                     }
                 },
                 Err(_) => {
                     resp.write_i8(-1);
-                    Respond(resp)
                 }
-            };
+            }
+            Respond(resp)
+        }
+
+        // get_sig
+        3 => {
+            let storage = storage.lock().unwrap();
+            let hash = c_try!(m.read_buffer()).to_vec();
+
+            let mut resp = Message::new();
+            match storage.get_sig(&hash) {
+                Ok(sig) => match sig {
+                    None => {
+                        resp.write_i8(0);
+                    }
+                    Some(sig) => {
+                        resp.write_i8(1);
+                        resp.write_buffer(&sig.obj);
+                        resp.write_buffer(&sig.user);
+                        resp.write_buffer(&sig.prev_sig);
+                        resp.write_buffer(&sig.signature);
+                    }
+                },
+                Err(_) => {
+                    resp.write_i8(-1);
+                }
+            }
+            Respond(resp)
         }
 
         // request_enqueue
@@ -232,11 +254,13 @@ fn process_message(mut m: Message, storage: &Mutex<LocalStorage>) -> ClientActio
     };
 }
 
+#[allow(unused_must_use)]
 fn queue_loop(rx: Receiver<ThreadMessage>, storage: Arc<Mutex<LocalStorage>>) {
     loop {
         match rx.try_recv() {
             Ok(m) => match m {
                 Accept(client) => {
+                    // We don't care if the enqueue was successful or not
                     handle_enqueue(client, &storage);
                 }
             },
@@ -246,18 +270,13 @@ fn queue_loop(rx: Receiver<ThreadMessage>, storage: Arc<Mutex<LocalStorage>>) {
 }
 
 fn handle_enqueue(mut client: TcpStream, storage: &Arc<Mutex<LocalStorage>>) -> Result<(), Error> {
-    let storage = storage.lock().unwrap();
-    let mut prev_hash = [0; 32];
+    let mut storage = storage.lock().unwrap();
     match storage.get_prev() {
         Ok(prev) => match prev {
-            Some((hash, f)) => {
-                prev_hash = hash;
+            Some(hash) => {
                 let mut m = Message::new();
                 m.write_i8(1);
-                m.write_buffer(&f.hash);
-                m.write_buffer(&f.user_hash);
-                m.write_buffer(&f.prev_hash);
-                m.write_buffer(&f.signature);
+                m.write_buffer(&hash);
                 client.write(&m)?;
             }
             None => {
@@ -278,27 +297,27 @@ fn handle_enqueue(mut client: TcpStream, storage: &Arc<Mutex<LocalStorage>>) -> 
         Ok(m) => match m {
             None => {}
             Some(mut m) => {
-                let hash = m.read_buffer()?.to_vec();
-                let user_hash = m.read_buffer()?.to_vec();
-                let signature = m.read_buffer()?.to_vec();
-                if hash.len() < 32 || hash.len() < 32 {
-                    return Err(CorruptedMessage);
-                }
+                let obj = m.read_buffer()?.to_vec()[..].try_into()?;
+                let user = m.read_buffer()?.to_vec()[..].try_into()?;
+                let prev_sig = m.read_buffer()?.to_vec()[..].try_into()?;
+                let signature = m.read_buffer()?.to_vec()[..].try_into()?;
+
+                let sig = Signature {
+                    obj,
+                    user,
+                    prev_sig,
+                    signature,
+                };
 
                 let mut resp = Message::new();
-                match storage.set_file(SignedFile {
-                    hash: (&hash[..32]).try_into()?,
-                    user_hash: (&user_hash[..32]).try_into()?,
-                    prev_hash,
-                    signature,
-                }) {
+                match storage.add_sig(sig) {
                     Ok(_) => {
                         resp.write_i8(0);
                     }
                     Err(_) => {
                         resp.write_i8(-1);
                     }
-                };
+                }
                 client.write(&resp)?;
             }
         },

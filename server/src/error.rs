@@ -4,11 +4,14 @@ use std::io;
 
 use simpletcp::simpletcp::MessageError;
 
-use crate::error::Error::{CorruptedMessage, IOError, NetworkError};
+use crate::error::Error::{CorruptedMessage, IOError, NetworkError, OpenSSLError};
+use openssl::error::ErrorStack;
+use std::convert::Infallible;
 
 #[derive(Debug)]
 pub enum Error {
     NetworkError(simpletcp::simpletcp::Error),
+    OpenSSLError(openssl::error::ErrorStack),
     IOError(io::Error),
     HashCollision,
     CorruptedStorage,
@@ -36,5 +39,17 @@ impl From<MessageError> for Error {
 impl From<TryFromSliceError> for Error {
     fn from(_: TryFromSliceError) -> Self {
         CorruptedMessage
+    }
+}
+
+impl From<Infallible> for Error {
+    fn from(_: Infallible) -> Self {
+        CorruptedMessage
+    }
+}
+
+impl From<openssl::error::ErrorStack> for Error {
+    fn from(e: ErrorStack) -> Self {
+        OpenSSLError(e)
     }
 }

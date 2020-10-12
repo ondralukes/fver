@@ -2,6 +2,7 @@ use crate::error::Error::{CorruptedMessage, EncodingError, IOError, NetworkError
 use simpletcp;
 use simpletcp::simpletcp::MessageError;
 use std::array::TryFromSliceError;
+use std::convert::Infallible;
 use std::fmt::{Debug, Formatter};
 use std::string::FromUtf8Error;
 use std::{fmt, io};
@@ -30,6 +31,12 @@ impl From<MessageError> for Error {
 
 impl From<TryFromSliceError> for Error {
     fn from(_: TryFromSliceError) -> Self {
+        CorruptedMessage
+    }
+}
+
+impl From<Infallible> for Error {
+    fn from(_: Infallible) -> Self {
         CorruptedMessage
     }
 }
